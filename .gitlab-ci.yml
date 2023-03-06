@@ -1,0 +1,250 @@
+stages:
+  - lint
+  - init-db
+  - test
+  - cleanup
+  - build
+  - deploy
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^main|develop$/'
+      variables:
+        IMAGE_TAG: '${CI_COMMIT_BRANCH}-${CI_PIPELINE_ID}'
+    - if: '$CI_COMMIT_TAG =~ /^v.*/'
+      variables:
+        IMAGE_TAG: '${CI_COMMIT_TAG}'
+
+variables:
+  BACKEND_IMAGE_NAME: "yelb-appserver"
+  FRONTEND_IMAGE_NAME: "yelb-ui"
+
+# Reuse common stages
+.builder:
+  stage: build
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://localhost:2375/
+  image: cr.yandex/yc/metadata-token-docker-helper:0.2
+  services:
+    - docker:19.03.1-dind
+
+.builder-appserver:
+  extends: .builder
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web"'
+      changes:
+        - yelb-appserver/**/*
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$FORCE_APPSERVER_PIPELINE == "true" && $CI_PIPELINE_SOURCE == "web"'
+      when: always
+
+.builder-ui:
+  extends: .builder
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web"'
+      changes:
+        - yelb-ui/**/*
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$FORCE_UI_PIPELINE == "true" && $CI_PIPELINE_SOURCE == "web"'
+      when: always
+
+# Configure kubectl
+.kubectl-config: &kubectl-config
+  - kubectl config set-cluster k8s --server="$KUBE_URL" --insecure-skip-tls-verify=true
+  - kubectl config set-credentials admin --token="$KUBE_TOKEN"
+  - kubectl config set-context default --cluster=k8s --user=admin
+  - kubectl config use-context default
+
+################  Linting  ################
+
+Helm:lint:
+  stage: lint
+  image: alpine/helm:3.11.1
+  script:
+    - env
+    - helm lint yelb-appserver/.helm
+    - helm lint yelb-ui/.helm
+
+###########################################
+
+################  Database ################
+DB:init:
+  stage: init-db
+  image: alpine:3.16
+  needs: []
+  variables:
+    PGHOST: ${DB_HOST}
+    PGPORT: ${DB_PORT}
+    PGDATABASE: ${DB_NAME}
+    PGUSER: ${DB_USERNAME}
+    PGPASSWORD: ${DB_PASSWORD}
+    PGTARGETSESSIONATTRS: 'read-write'
+    PGSSLMODE: 'verify-full'
+    DB_ENVIRONMENT: 'production'
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web"'
+      changes:
+        - yelb-db/*
+      when: always
+    - if: '$FORCE_DB_PIPELINE == "true"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: never
+  before_script:
+    - apk --no-cache add postgresql12-client wget bash
+    - mkdir --parents ~/.postgresql
+    - 'wget "https://storage.yandexcloud.net/cloud-certs/CA.pem" --output-document ~/.postgresql/root.crt'
+    - chmod 0600 ~/.postgresql/root.crt
+  script:
+    - if psql -qt -c "SELECT 1 FROM restaurants" > /dev/null 2>&1; then echo "Table exists"; exit 0; fi
+    - sh yelb-db/init-yelb-db.sh
+
+################ Appserver ################
+
+Appserver:test:
+  extends: .builder-appserver
+  stage: test
+  image:
+    name: docker/compose:1.27.4
+  script:
+    - docker-compose
+      -p "$CI_PROJECT_NAME"_"$CI_PIPELINE_ID"
+      -f yelb-appserver/docker-compose.yml
+      up
+      --build 
+      --abort-on-container-exit
+      --exit-code-from curlcheck
+
+Appserver:cleanup:
+  extends: .builder-appserver
+  stage: cleanup
+  image:
+    name: docker/compose:1.27.4
+  script:
+    - docker-compose
+      -p "$CI_PROJECT_NAME"_"$CI_PIPELINE_ID"
+      -f yelb-appserver/docker-compose.yml
+      down
+
+Appserver:build:
+  extends: .builder-appserver
+  stage: build
+  script:
+    - cd yelb-appserver
+    - docker build . -t ${YC_REGISTRY_ID}/${BACKEND_IMAGE_NAME}:${IMAGE_TAG} -t  ${YC_REGISTRY_ID}/${BACKEND_IMAGE_NAME}:latest
+    - docker push ${YC_REGISTRY_ID}/${BACKEND_IMAGE_NAME}:${IMAGE_TAG}
+    - docker push ${YC_REGISTRY_ID}/${BACKEND_IMAGE_NAME}:latest
+
+Appserver:deploy:
+  stage: deploy
+  environment:
+    name: production
+  image: centosadmin/kubernetes-helm:3.6.3
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web"'
+      changes:
+        - yelb-appserver/**/*
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$FORCE_APPSERVER_PIPELINE == "true"'
+      when: always
+
+  script:
+    - *kubectl-config
+    - cd yelb-appserver
+    - kubectl create namespace $CI_PROJECT_NAMESPACE-appserver-$CI_ENVIRONMENT_NAME || true
+    - helm upgrade --install appserver .helm
+      --set image.repository=${YC_REGISTRY_ID}/${BACKEND_IMAGE_NAME}
+      --set image.tag=${IMAGE_TAG}
+      --set cache.host="yelb-cache-redis-master.yelb-cache"
+      --set database.host="${DB_HOST}"
+      --set database.port="${DB_PORT}"
+      --set database.username="${DB_USERNAME}"
+      --set database.password="${DB_PASSWORD}"
+      --set database.name="${DB_NAME}"
+      --set replicaCount=${APPSERVER_REPLICA_COUNT}
+      --wait
+      --timeout 180s
+      --atomic
+      --debug
+      --namespace $CI_PROJECT_NAMESPACE-appserver-$CI_ENVIRONMENT_NAME
+
+###########################################
+
+#################### UI ###################
+
+UI:test:
+  extends: .builder-ui
+  stage: test
+  image:
+    name: docker/compose:1.27.4
+  script:
+    - env
+    - docker-compose
+      -p "$CI_PROJECT_NAME"_"$CI_PIPELINE_ID"
+      -f yelb-ui/docker-compose.yml
+      up
+      --build 
+      --abort-on-container-exit
+      --exit-code-from curlcheck
+
+UI:cleanup:
+  extends: .builder-ui
+  stage: cleanup
+  image:
+    name: docker/compose:1.27.4
+  script:
+    - docker-compose
+      -p "$CI_PROJECT_NAME"_"$CI_PIPELINE_ID"
+      -f yelb-ui/docker-compose.yml
+      down
+
+UI:build:
+  extends: .builder-ui
+  stage: build
+  script:
+    - cd yelb-ui
+    - docker build . -t ${YC_REGISTRY_ID}/${FRONTEND_IMAGE_NAME}:${IMAGE_TAG} -t  ${YC_REGISTRY_ID}/${FRONTEND_IMAGE_NAME}:latest
+    - docker push ${YC_REGISTRY_ID}/${FRONTEND_IMAGE_NAME}:${IMAGE_TAG}
+    - docker push ${YC_REGISTRY_ID}/${FRONTEND_IMAGE_NAME}:latest
+
+UI:deploy:
+  stage: deploy
+  environment:
+    name: production
+  image: centosadmin/kubernetes-helm:3.6.3
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "web"'
+      changes:
+        - yelb-ui/**/*
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$FORCE_UI_PIPELINE == "true"'
+      when: always
+
+  script:
+    - *kubectl-config
+    - cd yelb-ui
+    - kubectl create namespace $CI_PROJECT_NAMESPACE-ui-$CI_ENVIRONMENT_NAME || true
+    - helm upgrade --install yelb-ui .helm
+      --set image.repository=${YC_REGISTRY_ID}/${FRONTEND_IMAGE_NAME}
+      --set image.tag=${IMAGE_TAG}
+      --set backendUrl="appserver.$CI_PROJECT_NAMESPACE-appserver-$CI_ENVIRONMENT_NAME"
+      --set backendPort="4567"
+      --set ingress.enabled=true
+      --set replicaCount=${UI_REPLICA_COUNT}
+      --wait
+      --timeout 180s
+      --atomic
+      --debug
+      --namespace $CI_PROJECT_NAMESPACE-ui-$CI_ENVIRONMENT_NAME
+
+###########################################

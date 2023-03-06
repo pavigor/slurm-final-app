@@ -1,0 +1,62 @@
+---
+version: '2.1'
+services:
+  yelb-ui:
+    build: .
+    ports:
+      - "8080:80"
+    healthcheck:
+      test: ["CMD-SHELL", "service nginx status"]
+      interval: 5s
+      timeout: 1s
+      retries: 3
+    depends_on:
+      appserver:
+        condition: service_healthy
+    environment:
+      - UI_ENV=test # dev | test | prod
+      - APP_URL=appserver
+      - APP_PORT=4567
+  cache:
+    image: "redis:alpine"
+    restart: always
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+  appserver:
+    build: ../yelb-appserver
+    environment:
+      - YELB_CACHE=cache
+      - DATABASE_HOST=db
+      - RACK_ENV=test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "localhost:4567/api/hostname"]
+      interval: 1s
+      timeout: 1s
+      retries: 15
+    ports:
+     - "4567:4567"
+    depends_on:
+       cache:
+          condition: service_healthy
+       db:
+          condition: service_healthy
+  db:
+    image: "postgres:10.0"
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "postgres" ]
+      interval: 1s
+      timeout: 1s
+      retries: 60
+    environment:
+      - POSTGRES_PASSWORD=postgres_password
+    volumes:
+      - './test/init-yelb-db.sh:/docker-entrypoint-initdb.d/init-yelb-db.sh'
+  curlcheck:
+    image: "curlimages/curl:7.86.0"
+    command: "yelb-ui/"
+    depends_on:
+      yelb-ui:
+        condition: service_healthy

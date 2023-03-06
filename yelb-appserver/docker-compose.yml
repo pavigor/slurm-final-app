@@ -1,0 +1,48 @@
+---
+version: '2.1'
+services:
+  redis:
+    image: "redis:alpine"
+    restart: always
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+  appserver:
+    build: .
+    environment:
+      - YELB_CACHE=redis
+      - DATABASE_HOST=db
+      - DATABASE_PORT="5432"
+      - DATABASE_NAME=yelbdatabase
+      - RACK_ENV=test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "localhost:4567/api/hostname"]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+    ports:
+     - "4567:4567"
+    depends_on:
+       redis:
+          condition: service_healthy
+       db:
+          condition: service_healthy
+  db:
+    image: "postgres:10.0"
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "postgres" ]
+      interval: 1s
+      timeout: 1s
+      retries: 60
+    environment:
+      - POSTGRES_PASSWORD=postgres_password
+    volumes:
+      - './test/init-yelb-db.sh:/docker-entrypoint-initdb.d/init-yelb-db.sh'
+  curlcheck:
+    image: "curlimages/curl:7.86.0"
+    command: "appserver:4567/api/ihop"
+    depends_on:
+      appserver:
+        condition: service_healthy
